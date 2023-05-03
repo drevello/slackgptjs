@@ -1,0 +1,2 @@
+# slackgptjs
+SlackGPTjs
