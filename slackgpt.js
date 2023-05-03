@@ -1,5 +1,5 @@
-const express = require('express');
 const { WebClient } = require('@slack/web-api');
+const { SocketModeClient } = require('@slack/socket-mode');
 const OpenAI = require('openai');
 require('dotenv').config();
 
@@ -8,61 +8,85 @@ const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 const webClient = new WebClient(SLACK_BOT_TOKEN);
+const socketModeClient = new SocketModeClient({
+  appToken: SLACK_APP_TOKEN,
+  socketMode: true,
+});
+
 OpenAI.apiKey = OPENAI_API_KEY;
 
-const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+const conversationCache = new Map();
 
-async function chatWithGPT(prompt) {
+async function chatWithGPT(prompt, conversationID) {
+  const previousMessages = conversationCache.get(conversationID) || [
+    { role: 'system', content: 'You are a helpful assistant.' },
+  ];
+
   const response = await OpenAI.ChatCompletion.create({
     model: 'gpt-3.5-turbo',
-    messages: [
-      { role: 'system', content: 'You are a helpful assistant.' },
-      { role: 'user', content: prompt },
-    ],
+    messages: [...previousMessages, { role: 'user', content: prompt }],
   });
 
-  return response.choices[0].message.content.trim();
+  const assistantReply = response.choices[0].message.content.trim();
+
+  conversationCache.set(conversationID, [
+    ...previousMessages,
+    { role: 'user', content: prompt },
+    { role: 'assistant', content: assistantReply },
+  ]);
+
+  return assistantReply;
 }
 
-// Handle app_mention and message events
-app.post('/events', async (req, res) => {
-  const event = req.body.event;
-
-  if (event.type === 'app_mention' || (event.type === 'message' && event.channel_type === 'im')) {
-    const text = event.text;
-    const user = event.user;
-
-    const assistantReply = await chatWithGPT(text);
-
-    await webClient.chat.postMessage({
-      channel: event.channel,
-      text: `<@${user}> ${assistantReply}`,
-    });
-  }
-
-  res.sendStatus(200);
-});
-
-// Handle slash command events
-app.post('/slackgpt', async (req, res) => {
-  const text = req.body.text;
+socketModeClient.on('events_api', async ({ event, body, ack }) => {
+  console.log('Received event:', JSON.stringify(event));
 
   try {
-    const assistantReply = await chatWithGPT(text);
+    if (event.type === 'app_mention') {
+      const text = event.text.replace(/<@[^>]+>/g, '').trim(); // Remove mention from text
+      const user = event.user;
+      const channel = event.channel;
 
-    res.json({
-      response_type: 'in_channel',
-      text: assistantReply,
-    });
+      console.log('Processing app_mention event...');
+
+      const assistantReply = await chatWithGPT(text, channel);
+
+      await webClient.chat.postMessage({
+        channel,
+        text: `<@${user}> ${assistantReply}`,
+      });
+
+      console.log('Replied to app_mention event');
+    } else if (event.type === 'message' && event.channel_type === 'im') {
+      const text = event.text;
+      const user = event.user;
+      const channel = event.channel;
+
+      console.log('Processing direct message event...');
+
+      const assistantReply = await chatWithGPT(text, channel);
+
+      await webClient.chat.postMessage({
+        channel,
+        text: `<@${user}> ${assistantReply}`,
+      });
+
+      console.log('Replied to direct message event');
+    } else {
+      console.log('Unhandled event type:', event.type);
+    }
+    await ack();
   } catch (error) {
-    console.error(`Error handling slash command: ${error}`);
-    res.sendStatus(500);
+    console.error(`Error handling event: ${error}`);
+    await ack();
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-});
+(async () => {
+  try {
+    await socketModeClient.start();
+    console.log('App started with Socket Mode');
+  } catch (error) {
+    console.error(`Error starting the app: ${error}`);
+  }
+})();
